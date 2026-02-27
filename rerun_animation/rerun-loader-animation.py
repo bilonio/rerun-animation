@@ -10,7 +10,6 @@ from enum import Enum
 import colour  # pip install colour
 import numpy as np
 import rerun as rr  # pip install rerun-sdk
-from scipy.spatial.transform import Rotation as R
 from trimesh import load_mesh
 
 from rerun_animation.bvh import euler_angles_to_matrix
