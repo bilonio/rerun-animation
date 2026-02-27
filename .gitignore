@@ -173,6 +173,7 @@ node_modules/
 .hugo_build.lock
 
 ## Assets
+*.ply
 *.npz
 *.dll
 *.exe
