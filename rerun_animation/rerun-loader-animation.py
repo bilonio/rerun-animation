@@ -10,6 +10,8 @@ from enum import Enum
 import colour  # pip install colour
 import numpy as np
 import rerun as rr  # pip install rerun-sdk
+from scipy.spatial.transform import Rotation as R
+from trimesh import load_mesh
 
 from rerun_animation.bvh import euler_angles_to_matrix
 from rerun_animation.bvh import load as load_bvh
@@ -30,12 +32,140 @@ from rerun_animation.util import (
     flatten_globs,
     set_time_from_args,
     setup_rerun_logging,
+    get_package_path
 )
+from rerun_animation.load_mvnx import load_mvnx
+from rerun_animation.mvn import get_sensor_config
+from rerun_animation.mvnx_file_accessor import extract_xsens_data
 
 
 class Mode(Enum):
     BVH = 1
     BODY = 2
+    XSENS = 3
+
+
+def log_static_meshes(entity_root: str, mesh: object, color: np.ndarray, SENSORS:dict):
+    """Log meshes once as static instances to save memory."""
+    vertex_colors = np.tile(color, (len(mesh.vertices), 1))
+    for i in range(len(SENSORS)):
+        rr.log(
+            f"{entity_root}/{i}/mesh",
+            rr.Mesh3D(
+                vertex_positions=mesh.vertices / 1000.0,
+                triangle_indices=mesh.faces,
+                vertex_colors=vertex_colors,
+                vertex_normals=mesh.vertex_normals,
+            ),
+            static=True,
+        )
+
+def log_xsens_model(data_root: str, filepath: str, entity_path: str, config) -> None:
+    # Load mvnx file
+    mvnx_file = load_mvnx(filepath)
+
+    # Configure body type
+    body_type = config.get("xsens.options", "body", fallback="full_body_no_hands")
+    SENSORS = get_sensor_config(body_type)
+    (
+        sensor_orientation_matrix,
+        segment_positions,
+        segment_orientation_matrix,
+        joint_connections,
+    ) = extract_xsens_data(mvnx_file, SENSORS)
+
+    # Define the skeleton color
+    skeleton_color_key = config.get("xsens.options", "skeleton_color", fallback="magenta")
+    skeleton_color = colour.Color(skeleton_color_key).get_rgb() + (0.5,)
+
+    # Define the color for the sensor meshes
+    sensor_mesh_color_key = config.get(
+        "xsens.options", "sensor_color", fallback="orange"
+    )
+    sensor_mesh_color = colour.Color(sensor_mesh_color_key).get_rgb() + (0.5,)
+
+    imu_mesh = load_mesh(os.path.join(data_root, "MTi_10.ply"))
+    log_static_meshes(f"{entity_path}/sensors", imu_mesh, sensor_mesh_color, SENSORS)
+
+    if show_rotations := config.getboolean(
+        "xsens.options", "show_rotations", fallback=False
+    ):
+        axii_colors = np.array([[255, 0, 0], [0, 255, 0], [0, 0, 255]])
+
+    if show_segments := config.getboolean(
+        "xsens.options", "show_segments", fallback=False
+    ):
+        segment_mesh_color_key = config.get(
+            "xsens.options", "segment_color", fallback="black"
+        )
+        segment_mesh_color = colour.Color(segment_mesh_color_key).get_rgb() + (0.5,)
+        log_static_meshes(
+            f"{entity_path}/segments", imu_mesh, segment_mesh_color, SENSORS
+        )
+
+    for frame_idx in range(sensor_orientation_matrix.shape[0]):
+        rr.set_time("frame", sequence=frame_idx)
+        for sensor_idx, segment_idx in enumerate(SENSORS.keys()):
+            pos = segment_positions[frame_idx, segment_idx]  # Extract segment position
+            ori = sensor_orientation_matrix[
+                frame_idx, sensor_idx
+            ]  # Extract sensor orientation
+            rr.log(
+                f"{entity_path}/sensors/{sensor_idx}",
+                rr.Transform3D(mat3x3=[ori], translation=[pos]),
+            )  # Log sensor transform
+            if show_segments:
+                seg_ori = segment_orientation_matrix[frame_idx, sensor_idx]
+                rr.log(
+                    f"{entity_path}/segments/{sensor_idx}",
+                    rr.Transform3D(mat3x3=[seg_ori], translation=[pos]),
+                )
+        if show_rotations:
+            active_indices = list(SENSORS.keys())
+            all_pos = segment_positions[frame_idx, active_indices] # Shape (N, 3)
+            rr.log(
+            f"{entity_path}/sensors/rotations",
+            rr.Arrows3D(
+                # Tile each position 3 times (one for X, Y, and Z)
+                origins=np.repeat(all_pos, 3, axis=0), 
+                # Your reshaped matrix logic
+                vectors=sensor_orientation_matrix[frame_idx].transpose(0, 2, 1).reshape(-1, 3)*0.1,
+                colors=np.tile(axii_colors, (len(SENSORS), 1)),
+            ),
+            )
+            if show_segments:
+                rr.log(
+                f"{entity_path}/segments/rotations",
+                rr.Arrows3D(
+                    # Tile each position 3 times (one for X, Y, and Z)
+                    origins=np.repeat(all_pos, 3, axis=0), 
+                    # Your reshaped matrix logic
+                    vectors=segment_orientation_matrix[frame_idx].transpose(0, 2, 1).reshape(-1, 3)*0.1,
+                    colors=np.tile(axii_colors, (len(SENSORS), 1)),
+                ),
+                )
+            
+
+        # Create a simple skeleton connecting the segments with lines
+        for i, connection in enumerate(joint_connections):
+            seg_a_idx = connection[0]
+            seg_b_idx = connection[1]
+            pos_a = segment_positions[
+                frame_idx, seg_a_idx
+            ]  # Extract segment position for start of line
+            pos_b = segment_positions[
+                frame_idx, seg_b_idx
+            ]  # Extract segment position for end of line
+            rr.log(
+                f"{entity_path}/skeleton/bone_{i}",
+                rr.LineStrips3D(
+                    strips=[pos_a, pos_b],
+                    colors=skeleton_color,
+                    radii=0.005,
+                ),
+            )
+
+    return
 
 
 def log_bvh(filename: str, entity_path: str, config) -> None:
@@ -71,7 +201,6 @@ def log_bvh(filename: str, entity_path: str, config) -> None:
         ),
         static=True,
     )
-
     if show_rotations := config.getboolean(
         "bvh.options", "show_rotations", fallback=False
     ):
@@ -292,7 +421,7 @@ def get_args() -> None:
 def main() -> None:
     args = get_args()
     filepaths = flatten_globs(args.filepaths)
-    valid_extensions = set([".bvh", ".npz"])
+    valid_extensions = set([".bvh", ".npz", ".mvnx"])
     valid_filepaths = defaultdict(list)
     for filepath in filepaths:
         if os.path.isfile(filepath):
@@ -306,6 +435,10 @@ def main() -> None:
 
     data_root = os.environ.get("RERUN_ANIMATION_PLUGIN_DATA", "./bin")
     config_filename = os.path.join(data_root, Constants.CURRENT_CONFIG_FILENAME)
+    
+    pkg_path, _, _ = get_package_path()
+    mesh_data_root = os.path.join(pkg_path, "data")
+    os.makedirs(mesh_data_root, exist_ok=True)
 
     if not os.path.exists(config_filename):
         log.error(f"Could not find current config: {config_filename}.")
@@ -327,6 +460,9 @@ def main() -> None:
             case ".npz":
                 app_id = "body_model_data"
                 mode = Mode.BODY
+            case ".mvnx":
+                app_id = "xsens_model_data"
+                mode = Mode.XSENS
             case _:  # NOTE: should not get here
                 sys.exit(rr.EXTERNAL_DATA_LOADER_INCOMPATIBLE_EXIT_CODE)
         if args.application_id is not None:
@@ -357,6 +493,8 @@ def main() -> None:
                     log_bvh(filepath, entity_path, config)
                 case Mode.BODY:
                     log_smpl_body(data_root, filepath, entity_path, config)
+                case Mode.XSENS:
+                    log_xsens_model(mesh_data_root, filepath, entity_path, config)
 
 
 if __name__ == "__main__":

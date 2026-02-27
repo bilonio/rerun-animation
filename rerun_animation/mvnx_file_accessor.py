@@ -1,5 +1,7 @@
 import rerun_animation.mvn as mvn
 import warnings
+import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 
 class MvnxFileAccessor:
@@ -508,3 +510,85 @@ class MvnxFileAccessor:
                              self.file_data['frames'][data_set][frame]]
 
         return return_values[0] if is_single_frame else return_values
+
+
+def apply_z_offset(
+    sensor_ori: np.ndarray,  # (frames, sensor, 4) (quat)
+    num_frames: int,
+    num_sensors: int,
+) -> np.ndarray:  # (quaternions)
+    """
+    Function for applying 90 degree offset around z-axis in sensor rotations
+
+    :param sensor_ori: Numpy array containing sensor quaternions with dimensions (frames, sensors, 4)
+    :type sensor_ori: np.ndarray
+    :param num_frames: Number of frames
+    :type num_frames: int
+    :param num_sensors: Number of sensors
+    :type num_sensors: int
+    :return: Numpy array containing quaternions after the offset has been applied
+    :rtype: ndarray[_AnyShape, dtype[Any]]
+    """
+    # Vectorize sensor orientations and apply rotation around Z-axis by 90 degrees
+    z_offset = R.from_euler("z", 90, degrees=True).as_matrix()
+    flat_ori = R.from_quat(sensor_ori[:num_frames].reshape(-1, 4)).as_matrix()
+    corrected_ori = (
+        R.from_matrix(flat_ori @ z_offset).as_quat().reshape(num_frames, num_sensors, 4)
+    )
+    return corrected_ori
+
+
+def extract_xsens_data(mvnx_file, SENSORS:dict) -> tuple:
+    # Extract sensor_orientation
+    sensor_orientations = np.zeros(
+        (mvnx_file.frame_count, len(SENSORS), 4)
+    )  # 4 for quaternion (x,y,z,w)
+    for sensor_idx, segment_idx in enumerate(SENSORS.keys()):
+        sensor_data = mvnx_file.get_sensor_ori(segment_idx)
+        sensor_orientations[:, sensor_idx, :] = np.array(sensor_data)
+    sensor_orientations = apply_z_offset(
+        sensor_orientations[:, :, [1, 2, 3, 0]],
+        sensor_orientations.shape[0],
+        sensor_orientations.shape[1],
+    )
+    sensor_orientation_matrix = (
+        R.from_quat(sensor_orientations.reshape(-1, 4))
+        .as_matrix()
+        .reshape(sensor_orientations.shape[0], sensor_orientations.shape[1], 3, 3)
+    )
+    # Extract segment_position
+    segment_positions = np.zeros(
+        (mvnx_file.frame_count, len(mvn.SEGMENTS) - 1, 3)
+    )  # 3 for position (x,y,z)
+    for segment_idx, segment_name in enumerate(mvn.SEGMENTS.keys()):
+        if segment_idx == 23:  # Skip CENTER_OF_MASS
+            continue
+        segment_data = mvnx_file.get_segment_pos(segment_name)
+        segment_positions[:, segment_idx, :] = np.array(segment_data)
+
+    # Extract segment_orientation (optionally)
+    segment_orientation = np.zeros(
+        (mvnx_file.frame_count, len(mvn.SEGMENTS) - 1, 4)
+    )  # 4 for quaternion (x,y,z,w)
+    for segment_idx, segment_name in enumerate(mvn.SEGMENTS.keys()):
+        if segment_idx == 23:  # Skip CENTER_OF_MASS
+            continue
+        segment_data = mvnx_file.get_segment_ori(segment_name)
+        segment_orientation[:, segment_idx, :] = np.array(segment_data)
+    segment_orientation = segment_orientation[:, :, [1, 2, 3, 0]]
+
+    segment_orientation_matrix = sensor_orientation_matrix.copy()
+    for sensor_idx, segment_idx in enumerate(SENSORS.keys()):
+        segment_orientation_matrix[:, sensor_idx, :, :] = R.from_quat(segment_orientation[:, segment_idx]).as_matrix()
+
+    # Extract joint connections
+    joints = mvnx_file.file_data["joints"]
+    joint_connections = mvnx_file.get_joint_connections(joints)
+    # Store them as 2D numpy array
+    joint_connections = np.array(joint_connections)
+    return (
+        sensor_orientation_matrix,
+        segment_positions,
+        segment_orientation_matrix,
+        joint_connections,
+    )
